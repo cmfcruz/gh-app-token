@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set +x -o pipefail
+umask 077
+
+fail() {
+  printf 'gh-app-token: %s\n' "$1" >&2
+  exit 1
+}
+
+for command in cat chmod curl date jq mkdir mktemp mv openssl rm stat tr; do
+  command -v "$command" >/dev/null 2>&1 || fail "missing required command: $command"
+done
+
+[[ ${GITHUB_APP_ID:-} =~ ^[0-9]+$ ]] || fail 'GITHUB_APP_ID must be a decimal ID'
+[[ ${GITHUB_APP_INSTALLATION_ID:-} =~ ^[0-9]+$ ]] || fail 'GITHUB_APP_INSTALLATION_ID must be a decimal ID'
+[[ -n ${GITHUB_APP_PRIVATE_KEY_FILE:-} && -f $GITHUB_APP_PRIVATE_KEY_FILE && -r $GITHUB_APP_PRIVATE_KEY_FILE ]] ||
+  fail 'GITHUB_APP_PRIVATE_KEY_FILE must name a readable file'
+[[ ${HOME:-} == /* ]] || fail 'HOME must be an absolute path'
+
+cache_dir=$HOME/.cache/gh-app-token
+cache_file=$cache_dir/$GITHUB_APP_ID-$GITHUB_APP_INSTALLATION_ID
+[[ ! -L $cache_dir ]] || fail 'cache directory must not be a symlink'
+if [[ ! -d $cache_dir ]]; then
+  mkdir -p "$cache_dir" 2>/dev/null || fail 'cannot create cache directory'
+fi
+[[ -d $cache_dir && ! -L $cache_dir ]] || fail 'invalid cache directory'
+chmod 700 "$cache_dir" 2>/dev/null || fail 'cannot secure cache directory'
+if [[ -e $cache_file || -L $cache_file ]]; then
+  [[ -f $cache_file && ! -L $cache_file ]] || fail 'invalid cache file'
+  chmod 600 "$cache_file" 2>/dev/null || fail 'cannot secure cache file'
+fi
+
+base64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+now=$(date +%s)
+
+if [[ -f $cache_file ]] &&
+  { modified=$(stat -c '%Y' "$cache_file" 2>/dev/null) ||
+    modified=$(stat -f '%m' "$cache_file" 2>/dev/null); }; then
+  age=$((now - 10#$modified))
+  if ((age >= 0 && age < 1800)); then
+    cat "$cache_file" || fail 'cannot read cache file'
+    exit 0
+  fi
+fi
+
+iat=$((now - 60))
+exp=$((now + 600))
+
+header=$(printf '%s' '{"alg":"RS256","typ":"JWT"}' | base64url)
+payload=$(printf '{"iat":%s,"exp":%s,"iss":"%s"}' "$iat" "$exp" "$GITHUB_APP_ID" | base64url)
+message=$header.$payload
+signature=$(printf '%s' "$message" | openssl dgst -sha256 -sign "$GITHUB_APP_PRIVATE_KEY_FILE" 2>/dev/null | base64url) ||
+  fail 'cannot sign JWT'
+jwt=$message.$signature
+
+token=$(
+  printf 'header = "Authorization: Bearer %s"\n' "$jwt" |
+    curl -q --config - --fail --silent --request POST \
+      --header 'Accept: application/vnd.github+json' \
+      --header 'X-GitHub-Api-Version: 2026-03-10' \
+      "https://api.github.com/app/installations/$GITHUB_APP_INSTALLATION_ID/access_tokens" |
+    jq -er '.token | strings | select(length > 0)' 2>/dev/null
+) || fail 'GitHub token request failed or response was malformed'
+
+temp_file=$(mktemp "$cache_dir/.gh-app-token.XXXXXX" 2>/dev/null) || fail 'cannot create cache file'
+trap 'rm -f "$temp_file"' EXIT
+printf '%s\n' "$token" > "$temp_file" || fail 'cannot write cache file'
+mv -f "$temp_file" "$cache_file" 2>/dev/null || fail 'cannot replace cache file'
+trap - EXIT
+printf '%s\n' "$token"
